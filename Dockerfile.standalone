@@ -63,8 +63,9 @@ RUN cd /qemu \
 # reach a rebuilt image: bump this when an asset is republished (2026-09-27:
 # libqemu-xtensa 1.2.8 stopped the phantom camera VSYNC on GPIO25, #333;
 # 2026-10-14: 1.2.9 lets an RMT frame longer than one memory chunk finish,
-# so a NeoPixel strip of 2+ pixels lights on the ESP32, #381).
-ARG QEMU_ASSETS_REV=xtensa-1.2.9
+# so a NeoPixel strip of 2+ pixels lights on the ESP32, #381; the arm64
+# build of 1.2.9 was published after the first amd64 image, hence .1).
+ARG QEMU_ASSETS_REV=xtensa-1.2.9.1
 # Download arch-specific .so and arch-independent ROM files.
 # The gated endpoint serves the same byte-for-byte content as the legacy
 # GitHub Release path; asset paths just drop the .so extension since the
