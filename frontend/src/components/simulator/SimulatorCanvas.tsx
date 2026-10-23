@@ -346,13 +346,16 @@ export const SimulatorCanvas = ({ headerSlot }: SimulatorCanvasProps = {}) => {
   // be AFTER the boards are on the canvas: a restored workspace draft puts
   // them there on mount. An attach that ran before registration found no
   // builtins for the kind and nothing ran it again, so the board's LCD stayed
-  // dark for the whole session. A registration re-runs it.
+  // dark for the whole session. A registration re-runs it, and so does a
+  // bridge rebuild: the overlay swaps such a board's stock bridge for its own
+  // right after, and buttons wired to the old one press nothing.
   const proBoardsVersion = useSyncExternalStore(
     subscribeProBoards,
     getProBoardsVersion,
     getProBoardsVersion,
   );
-  const attachKey = `${boards.map((b) => `${b.id}:${b.boardKind}`).join('|')}#${proBoardsVersion}`;
+  const esp32BridgeEpoch = useSimulatorStore((s) => s.esp32BridgeEpoch);
+  const attachKey = `${boards.map((b) => `${b.id}:${b.boardKind}`).join('|')}#${proBoardsVersion}#${esp32BridgeEpoch}`;
   useEffect(() => {
     const cleanups: (() => void)[] = [];
     const pending: Array<ReturnType<typeof setInterval>> = [];
