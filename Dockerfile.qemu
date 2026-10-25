@@ -1,0 +1,64 @@
+# syntax=docker/dockerfile:1.7
+# Builds the Velxio-patched QEMU source, not generic Espressif/PICSimLab QEMU.
+# Prerequisites in Docker build context:
+#   third-party/velxio-qemu/  (pinned Git submodule with full Velxio QEMU sources)
+#   qemu-assets/roms/        (four independently preserved ROM files + SHA256SUMS)
+# Output image contains /qemu/*.so and /qemu/*-rom*.bin for Dockerfile.standalone.
+
+FROM ubuntu:22.04 AS qemu-build
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential git wget curl ca-certificates \
+    python3 python3-pip python3-setuptools \
+    ninja-build pkg-config flex bison dpkg-dev \
+    libglib2.0-dev libgcrypt20-dev libslirp-dev \
+    libpixman-1-dev libfdt-dev zlib1g-dev jq file binutils \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -m pip install --no-cache-dir 'meson==1.2.3' tomli
+
+# QEMU build scripts may link with -liconv; glibc already provides its functions.
+RUN multiarch="$(dpkg-architecture -q DEB_HOST_MULTIARCH)" \
+    && mkdir -p "/usr/lib/${multiarch}" \
+    && ar rcs "/usr/lib/${multiarch}/libiconv.a"
+
+WORKDIR /src
+COPY third-party/velxio-qemu/ /src/
+
+# Use the exact build script bundled in Velxio's corresponding source archive.
+RUN test -s /src/build_libqemu-esp32.sh \
+    && bash /src/build_libqemu-esp32.sh
+
+RUN set -eu; \
+    mkdir -p /qemu; \
+    for base in libqemu-xtensa libqemu-riscv32; do \
+      so="/src/build/${base}.so"; \
+      test -s "$so"; \
+      test "$(stat -c %s "$so")" -gt 1000000; \
+      cp "$so" /qemu/; \
+    done
+
+COPY qemu-assets/roms/ /qemu/
+
+# Fail during Docker build if inputs are missing, corrupted or wrongly linked.
+RUN set -eu; \
+    cd /qemu; \
+    test -s SHA256SUMS; \
+    sha256sum -c SHA256SUMS; \
+    for rom in \
+      esp32-v3-rom.bin esp32-v3-rom-app.bin \
+      esp32c3-rom.bin esp32s3_rev0_rom.bin; do \
+      test -s "$rom"; \
+    done; \
+    for so in libqemu-xtensa.so libqemu-riscv32.so; do \
+      file "$so" | grep -F 'ELF 64-bit'; \
+      ldd "$so" > /tmp/ldd-output; \
+      cat /tmp/ldd-output; \
+      if grep -q 'not found' /tmp/ldd-output; then exit 1; fi; \
+    done; \
+    nm -D libqemu-xtensa.so > /tmp/qemu-symbols; \
+    grep -F 'qemu_picsimlab_register_callbacks' /tmp/qemu-symbols
+
+# Artifact-only image: the Velxio runtime copies /qemu/ into /app/lib/.
+FROM scratch
+COPY --from=qemu-build /qemu/ /qemu/
