@@ -1,7 +1,21 @@
-# ESP-IDF toolchain image — built once, pulled many times.
-# Published to GHCR by build-espidf-toolchain.yml Action.
-# Usage: docker build -f Dockerfile.espidf-toolchain -t velxio-espidf-toolchain .
+# syntax=docker/dockerfile:1.7
+# Velxio custom: reusable ESP-IDF + Arduino-ESP32 toolchain image.
+# Consumed by Dockerfile.standalone using ESPIDF_IMAGE.
+# Default target: ESP32-S3 only.
+#
+# Example:
+# docker buildx build --platform linux/amd64 \
+#   -f Dockerfile.espidf-toolchain \
+#   -t velxio-espidf-toolchain:idf-5.5.5-arduino-3.3.12 .
+
 FROM ubuntu:22.04
+
+ARG IDF_VERSION=v5.5.5
+ARG ARDUINO_ESP32_VERSION=3.3.12
+ARG IDF_TARGETS=esp32s3
+
+LABEL org.opencontainers.image.description="Velxio ESP-IDF and Arduino-ESP32 compilation toolchain" \
+      org.opencontainers.image.version="idf-5.5.5-arduino-3.3.12"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git wget flex bison gperf python3 python3-pip python3-venv \
@@ -9,44 +23,41 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libusb-1.0-0 ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# ESP-IDF v5.5.5 + arduino-esp32 3.3.12 — the same pair velxio.dev builds
-# with. espidf_compiler discovers them at /opt/esp-idf-v5 and
-# /opt/arduino-esp32-3 (overridable via IDF5_PATH / ARDUINO_ESP32_5_PATH) and
-# routes every ESP32-family Arduino build through them (_use_idf5).
-#
-# History: until 2026-08 this stage pinned IDF 4.4.7 + core 2.0.17 because
-# the original qemu-8.1.3 WiFi shim crashed on IDF 5.x cache handling. The
-# current libqemu builds run IDF 5.x firmware, and velxio.dev moved to the
-# 3.x core; shipping 2.0.17 here meant sketches written on velxio.dev
-# (ledcAttach, esp_now_recv_info_t, the esp_task_wdt config API, ...) did
-# not compile on a self-hosted image.
-RUN git clone \
-    --branch v5.5.5 \
-    --depth=1 \
-    --recursive \
-    --shallow-submodules \
-    https://github.com/espressif/esp-idf.git \
-    /opt/esp-idf-v5
+# ESP-IDF; keep precisely these paths for Dockerfile.standalone.
+RUN git clone --branch "${IDF_VERSION}" --depth=1 \
+    --recursive --shallow-submodules \
+    https://github.com/espressif/esp-idf.git /opt/esp-idf-v5
 
 WORKDIR /opt/esp-idf-v5
 
-# Every family toolchain. Classic-ESP32 builds need the v5.5 xtensa toolchain
-# too: with only the RISC-V targets installed they silently pick whatever GCC
-# is on PATH and die mid-build on newlib header mismatches.
-# RUN ./install.sh esp32,esp32s3,esp32c3,esp32c6
-# Target exclusivo ESP32-S3
-RUN ./install.sh esp32s3
+# Installs the Xtensa compiler and host tools for ESP32-S3.
+# To compile historical ESP32/ESP32-C3 E2E sketches with THIS image instead
+# of a separate test toolchain, build with:
+#   --build-arg IDF_TARGETS=esp32,esp32s3,esp32c3
+RUN ./install.sh "${IDF_TARGETS}"
 
-# Clean up large unnecessary files to reduce image size
-RUN rm -rf .git docs examples \
-    && find /root/.espressif -name '*.tar.*' -delete 2>/dev/null || true
+# Arduino-ESP32 as an ESP-IDF component. Keep the submodules.
+RUN git clone --branch "${ARDUINO_ESP32_VERSION}" --depth=1 \
+    --recursive --shallow-submodules \
+    https://github.com/espressif/arduino-esp32.git /opt/arduino-esp32-3
 
-# Arduino-as-component (3.x core, IDF 5.5 based) for full Arduino API support
-RUN git clone \
-    --branch 3.3.12 \
-    --depth=1 \
-    --recursive \ 
-    --shallow-submodules \
-    https://github.com/espressif/arduino-esp32.git \
-    /opt/arduino-esp32-3 \
-    && rm -rf /opt/arduino-esp32-3/.git
+# Fail early if sources do not match the chosen release pair.
+RUN set -eu; \
+    idf=/opt/esp-idf-v5/components/esp_common/include/esp_idf_version.h; \
+    ard=/opt/arduino-esp32-3/cores/esp32/esp_arduino_version.h; \
+    grep -Eq '^#define[[:space:]]+ESP_IDF_VERSION_MAJOR[[:space:]]+5([[:space:]]|$)' "$idf"; \
+    grep -Eq '^#define[[:space:]]+ESP_IDF_VERSION_MINOR[[:space:]]+5([[:space:]]|$)' "$idf"; \
+    grep -Eq '^#define[[:space:]]+ESP_IDF_VERSION_PATCH[[:space:]]+5([[:space:]]|$)' "$idf"; \
+    grep -Eq '^#define[[:space:]]+ESP_ARDUINO_VERSION_MAJOR[[:space:]]+3([[:space:]]|$)' "$ard"; \
+    grep -Eq '^#define[[:space:]]+ESP_ARDUINO_VERSION_MINOR[[:space:]]+3([[:space:]]|$)' "$ard"; \
+    grep -Eq '^#define[[:space:]]+ESP_ARDUINO_VERSION_PATCH[[:space:]]+12([[:space:]]|$)' "$ard"; \
+    echo 'Verified: ESP-IDF 5.5.5 and Arduino-ESP32 3.3.12'
+
+# Reduce image size without removing components used by the build system.
+RUN rm -rf /opt/esp-idf-v5/.git /opt/esp-idf-v5/docs /opt/esp-idf-v5/examples \
+           /opt/arduino-esp32-3/.git \
+    && find /root/.espressif -type f \( -name '*.tar.*' -o -name '*.zip' \) -delete
+
+ENV IDF_PATH=/opt/esp-idf-v5 \
+    IDF_TOOLS_PATH=/root/.espressif \
+    ARDUINO_ESP32_5_PATH=/opt/arduino-esp32-3
