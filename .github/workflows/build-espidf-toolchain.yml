@@ -1,46 +1,124 @@
 name: Build ESP-IDF Toolchain Image
 
-# Runs when Dockerfile.espidf-toolchain changes, or manually
 on:
   push:
-    branches: [master]
+    branches:
+      - main
     paths:
       - 'Dockerfile.espidf-toolchain'
+      - '.github/workflows/build-espidf-toolchain.yml'
   workflow_dispatch:
-
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/velxio-espidf-toolchain
 
 permissions:
   contents: read
   packages: write
 
+concurrency:
+  group: espidf-toolchain-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IDF_VERSION: v5.5.5
+  ARDUINO_VERSION: 3.3.12
+  IDF_TARGETS: esp32s3
+  IMAGE_VERSION: idf-5.5.5-arduino-3.3.12
+
 jobs:
   build-toolchain:
-    runs-on: ubuntu-latest
+    name: Build, Test and Publish Toolchain
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Prepare GHCR image name
+        id: image
+        shell: bash
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "name=ghcr.io/${owner}/velxio-espidf-toolchain" \
+            >> "$GITHUB_OUTPUT"
+
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3.12.0
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+
+      - name: Build ESP-IDF toolchain
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: .
+          file: ./Dockerfile.espidf-toolchain
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: |
+            ${{ steps.image.outputs.name }}:${{ env.IMAGE_VERSION }}
+          build-args: |
+            IDF_VERSION=${{ env.IDF_VERSION }}
+            ARDUINO_ESP32_VERSION=${{ env.ARDUINO_VERSION }}
+            IDF_TARGETS=${{ env.IDF_TARGETS }}
+          cache-from: type=gha,scope=espidf
+          cache-to: type=gha,scope=espidf,mode=min
+
+      - name: Validate ESP-IDF and Arduino versions
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+        shell: bash
+        run: |
+          docker run --rm \
+            "${IMAGE}:${IMAGE_VERSION}" \
+            bash -lc '
+              set -e
+
+              source /opt/esp-idf-v5/export.sh >/dev/null
+
+              echo "Checking ESP-IDF..."
+              idf.py --version | grep -F "v5.5.5"
+
+              echo "Checking ESP32-S3 toolchain..."
+              command -v xtensa-esp32s3-elf-gcc
+              xtensa-esp32s3-elf-gcc --version
+
+              echo "Checking Arduino-ESP32..."
+              HEADER=/opt/arduino-esp32-3/cores/esp32/esp_arduino_version.h
+
+              grep -Eq "^#define ESP_ARDUINO_VERSION_MAJOR[[:space:]]+3$" "$HEADER"
+              grep -Eq "^#define ESP_ARDUINO_VERSION_MINOR[[:space:]]+3$" "$HEADER"
+              grep -Eq "^#define ESP_ARDUINO_VERSION_PATCH[[:space:]]+12$" "$HEADER"
+
+              echo "Toolchain validation passed."
+            '
 
       - name: Log in to GHCR
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3.7.0
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push ESP-IDF toolchain image
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
-        with:
-          context: .
-          file: Dockerfile.espidf-toolchain
-          push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:idf-4.4.7
-          cache-from: type=gha,scope=espidf
-          cache-to: type=gha,scope=espidf,mode=max
+      - name: Publish validated image
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VERSION_TAG="${IMAGE}:${IMAGE_VERSION}"
+          SHA_TAG="${IMAGE}:sha-${GITHUB_SHA:0:12}"
+          LATEST_TAG="${IMAGE}:latest"
+
+          docker push "$VERSION_TAG"
+
+          docker tag "$VERSION_TAG" "$SHA_TAG"
+          docker push "$SHA_TAG"
+
+          docker tag "$VERSION_TAG" "$LATEST_TAG"
+          docker push "$LATEST_TAG"
+
+          echo "### ESP-IDF Toolchain published" >> "$GITHUB_STEP_SUMMARY"
+          echo "- ESP-IDF: ${IDF_VERSION}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Arduino-ESP32: ${ARDUINO_VERSION}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Target: ${IDF_TARGETS}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Image: \`${VERSION_TAG}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Commit: \`${SHA_TAG}\`" >> "$GITHUB_STEP_SUMMARY"
