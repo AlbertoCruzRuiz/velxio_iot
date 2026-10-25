@@ -1,147 +1,34 @@
-# ---- Stage 0: QEMU .so + ROM binaries ----
-# The Velxio runtime needs libqemu-xtensa.so + libqemu-riscv32.so (the
-# QEMU shared libraries that simulate ESP32 / ESP32-S3 / ESP32-C3) plus
-# the matching boot ROM blobs. Three sources, tried in order:
+# syntax=docker/dockerfile:1.7
+# Velxio custom - standalone runtime built from independently versioned images.
 #
-#   1. Local prebuilt files at prebuilt/qemu/<file>.
-#      Drop your own compiled .so files in there (see docs/BUILD-QEMU.md
-#      for the full build-from-source guide) and they win — no network
-#      access required.
+# Prerequisites: publish/build the two separate images first:
+#   - ESP-IDF v5.5.5 + Arduino-ESP32 3.3.12, with toolchains for the targets
+#     used by your tests (at least ESP32-S3).
+#   - Velxio-patched libqemu-xtensa.so / libqemu-riscv32.so, and matching ROMs
+#     in /qemu/ (NOT a generic upstream QEMU build).
 #
-#   2. velxio.dev gated download endpoint, when VELXIO_LICENSE_KEY is set.
-#      Free personal-tier keys at https://velxio.dev/license/signup.
+# Override these images in CI using Docker build args ESPIDF_IMAGE and QEMU_IMAGE:
+# docker buildx build -f Dockerfile.standalone --platform linux/amd64 \
+#   --build-arg ESPIDF_IMAGE=ghcr.io/USER/velxio-espidf-toolchain:idf-5.5.5-arduino-3.3.12 \
+#   --build-arg QEMU_IMAGE=ghcr.io/USER/velxio-qemu:VERSION .
 #
-#   3. Build fails with a clear error telling you which of the two paths
-#      to pick.
-#
-# Backward compatibility: the old QEMU_RELEASE_URL ARG is still accepted
-# so forks pointing at a private mirror of the binaries keep working.
-FROM ubuntu:22.04 AS qemu-provider
+# No Velxio license key or QEMU asset download is used in this Dockerfile.
 
-RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+# ---- Stage 0: independently built QEMU + ROM bundle ----
+ARG QEMU_IMAGE=velxio-qemu:local
+ARG ESPIDF_IMAGE=velxio-espidf-toolchain:idf-5.5.5-arduino-3.3.12
+FROM ${QEMU_IMAGE} AS qemu-provider
 
-ARG TARGETARCH
-ARG VELXIO_LICENSE_KEY=
-ARG VELXIO_BINARY_BASE_URL=https://velxio.dev/api/pro/license/downloads
-# Legacy escape hatch — set this to keep using the old GitHub Release
-# mirror (or any other CDN you proxy from). When set, takes precedence
-# over the gated path.
-ARG QEMU_RELEASE_URL=
+# ---- Stage 0.5: independently built ESP-IDF and Arduino core ----
+FROM ${ESPIDF_IMAGE} AS espidf-builder
 
-# Copy the prebuilt directory (may contain .so+ROM files or just the .gitkeep)
-RUN mkdir -p /qemu
-COPY prebuilt/qemu/ /qemu/
-
-# Resolve which fetch path the build will use and fail-fast with a
-# friendly message if neither prebuilt files nor a key were provided.
-RUN cd /qemu \
- && have_libs=1 && for base in libqemu-xtensa libqemu-riscv32; do \
-      [ -f "${base}.so" ] || have_libs=0 ; \
-    done \
- && if [ "$have_libs" = "1" ]; then \
-      echo "[qemu-provider] using local prebuilt/qemu/ files — no download" ; \
-    elif [ -n "${QEMU_RELEASE_URL}" ]; then \
-      echo "[qemu-provider] using legacy QEMU_RELEASE_URL: ${QEMU_RELEASE_URL}" ; \
-    elif [ -n "${VELXIO_LICENSE_KEY}" ]; then \
-      echo "[qemu-provider] using velxio.dev gated download with provided license key" ; \
-    else \
-      echo "" ; \
-      echo "ERROR: Velxio docker build needs the QEMU runtime libraries." ; \
-      echo "" ; \
-      echo "Pick one:" ; \
-      echo "  a) Free personal key from https://velxio.dev/license/signup ," ; \
-      echo "     then re-build with --build-arg VELXIO_LICENSE_KEY=vlx_personal_..." ; \
-      echo "  b) Build QEMU yourself (see docs/BUILD-QEMU.md) and drop the .so" ; \
-      echo "     files plus the three esp32*-rom.bin files into prebuilt/qemu/." ; \
-      echo "" ; \
-      exit 1 ; \
-    fi
-
-# The asset versions the gated endpoint serves right now. The download below
-# lives in a cached layer, so a new libqemu on velxio.dev would otherwise never
-# reach a rebuilt image: bump this when an asset is republished (2026-09-27:
-# libqemu-xtensa 1.2.8 stopped the phantom camera VSYNC on GPIO25, #333;
-# 2026-10-14: 1.2.9 lets an RMT frame longer than one memory chunk finish,
-# so a NeoPixel strip of 2+ pixels lights on the ESP32, #381; the arm64
-# build of 1.2.9 was published after the first amd64 image, hence .1).
-ARG QEMU_ASSETS_REV=xtensa-1.2.9.1
-# Download arch-specific .so and arch-independent ROM files.
-# The gated endpoint serves the same byte-for-byte content as the legacy
-# GitHub Release path; asset paths just drop the .so extension since the
-# license module's manifest carries the real filename.
-RUN echo "[qemu-provider] assets rev ${QEMU_ASSETS_REV}" && cd /qemu \
- && for base in libqemu-xtensa libqemu-riscv32; do \
-      f="${base}.so" ; \
-      if [ -f "$f" ]; then \
-        echo "Using local $f ($(stat -c%s "$f") bytes)" ; \
-      elif [ -n "${QEMU_RELEASE_URL}" ]; then \
-        echo "Downloading ${base}-${TARGETARCH}.so → $f (legacy URL) ..." ; \
-        curl -fSL -o "$f" "${QEMU_RELEASE_URL}/${base}-${TARGETARCH}.so" ; \
-      else \
-        echo "Downloading ${base}-${TARGETARCH} → $f (velxio.dev) ..." ; \
-        curl -fSL -o "$f" "${VELXIO_BINARY_BASE_URL}/${base}-${TARGETARCH}?key=${VELXIO_LICENSE_KEY}" ; \
-      fi ; \
-    done \
- && for f in esp32-v3-rom.bin esp32-v3-rom-app.bin esp32c3-rom.bin esp32s3_rev0_rom.bin; do \
-      asset="${f%.bin}" ; \
-      if [ -f "$f" ]; then \
-        echo "Using local $f ($(stat -c%s "$f") bytes)" ; \
-      elif [ -n "${QEMU_RELEASE_URL}" ]; then \
-        echo "Downloading $f (legacy URL) ..." ; \
-        curl -fSL -o "$f" "${QEMU_RELEASE_URL}/$f" ; \
-      else \
-        echo "Downloading $asset → $f (velxio.dev) ..." ; \
-        curl -fSL -o "$f" "${VELXIO_BINARY_BASE_URL}/${asset}?key=${VELXIO_LICENSE_KEY}" ; \
-      fi ; \
-    done \
- && ls -lh /qemu/
-
-
-# ---- Stage 0.5: ESP-IDF toolchain for ESP32 compilation ----
-FROM ubuntu:22.04 AS espidf-builder
-
+# ---- Stage 0.6: mkspiffs, retained from the original standalone image ----
+# The existing Dockerfile.espidf-toolchain does not include mkspiffs.
+# Build it independently so uploaded SPIFFS contents still work.
+FROM ubuntu:22.04 AS mkspiffs-builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git wget flex bison gperf python3 python3-pip python3-venv \
-    cmake ninja-build ccache libffi-dev libssl-dev \
-    libusb-1.0-0 ca-certificates \
+    wget ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-
-# ESP-IDF v5.5.4 + arduino-esp32 3.3.10 — the same pair velxio.dev builds
-# with. espidf_compiler discovers them at /opt/esp-idf-v5 and
-# /opt/arduino-esp32-3 (overridable via IDF5_PATH / ARDUINO_ESP32_5_PATH) and
-# routes every ESP32-family Arduino build through them (_use_idf5).
-#
-# History: until 2026-08 this stage pinned IDF 4.4.7 + core 2.0.17 because
-# the original qemu-8.1.3 WiFi shim crashed on IDF 5.x cache handling. The
-# current libqemu builds run IDF 5.x firmware, and velxio.dev moved to the
-# 3.x core; shipping 2.0.17 here meant sketches written on velxio.dev
-# (ledcAttach, esp_now_recv_info_t, the esp_task_wdt config API, ...) did
-# not compile on a self-hosted image.
-RUN git clone -b v5.5.4 --recursive --depth=1 --shallow-submodules \
-    https://github.com/espressif/esp-idf.git /opt/esp-idf-v5
-
-WORKDIR /opt/esp-idf-v5
-
-# Every family toolchain. Classic-ESP32 builds need the v5.5 xtensa toolchain
-# too: with only the RISC-V targets installed they silently pick whatever GCC
-# is on PATH and die mid-build on newlib header mismatches.
-RUN ./install.sh esp32,esp32s3,esp32c3,esp32c6
-
-# Clean up large unnecessary files to reduce image size
-RUN rm -rf .git docs examples \
-    && find /root/.espressif -name '*.tar.*' -delete 2>/dev/null || true
-
-# Arduino-as-component (3.x core, IDF 5.5 based) for full Arduino API support
-RUN git clone --branch 3.3.10 --depth=1 --recursive --shallow-submodules \
-    https://github.com/espressif/arduino-esp32.git /opt/arduino-esp32-3 \
- && rm -rf /opt/arduino-esp32-3/.git
-
-# mkspiffs (arduino-esp32 0.2.3 flavor) — bakes uploaded files into the SPIFFS
-# data-partition image at compile time. Without it espidf_compiler._build_spiffs_image
-# silently returns None and ships a blank SPIFFS region, so SPIFFS.begin() fails and
-# auto-formats and user-uploaded files never appear (GH #162). Installed at the exact
-# path the runtime locates via IDF_TOOLS_PATH (tools/mkspiffs/*/mkspiffs/mkspiffs).
 RUN mkdir -p /root/.espressif/tools/mkspiffs/0.2.3/mkspiffs \
  && wget -qO /tmp/mkspiffs.tgz \
       https://github.com/igrr/mkspiffs/releases/download/0.2.3/mkspiffs-0.2.3-arduino-esp32-linux64.tar.gz \
@@ -293,8 +180,8 @@ COPY --from=frontend-builder /app/frontend/dist /usr/share/nginx/html
 COPY docker/entrypoint.sh /app/entrypoint.sh
 RUN sed -i 's/\r$//' /app/entrypoint.sh && chmod +x /app/entrypoint.sh
 
-# ── ESP32 emulation: pre-built QEMU .so + ROM binaries ──────────────────────
-# Downloaded from GitHub Release (public — no access to qemu-lcgamboa needed)
+# ── ESP32 emulation: our independently-built QEMU .so + ROMs ──────────────
+# Produced by our dedicated QEMU image from Velxio-patched QEMU sources.
 # libqemu-xtensa.so    → ESP32 / ESP32-S3 (Xtensa LX6/LX7)
 # libqemu-riscv32.so   → ESP32-C3 (RISC-V RV32IMC)
 # esp32-v3-rom*.bin    → boot/app ROM images required by esp32-picsimlab machine
@@ -304,6 +191,14 @@ RUN sed -i 's/\r$//' /app/entrypoint.sh && chmod +x /app/entrypoint.sh
 #       to QEMU pointing at os.path.dirname(lib_path))
 RUN mkdir -p /app/lib
 COPY --from=qemu-provider /qemu/ /app/lib/
+# Include the original support for classic ESP32/ESP32-C3/ESP32-CAM tests.
+RUN set -eu; \
+    for f in libqemu-xtensa.so libqemu-riscv32.so \
+             esp32-v3-rom.bin esp32-v3-rom-app.bin \
+             esp32c3-rom.bin esp32s3_rev0_rom.bin; do \
+        test -s "/app/lib/$f" || { echo "Missing or empty QEMU asset: $f" >&2; exit 1; }; \
+    done; \
+    echo 'QEMU and ROM asset bundle present'
 
 # Activate ESP32 emulation
 # QEMU_ESP32_LIB    → Xtensa library (ESP32, ESP32-S3)
@@ -311,11 +206,28 @@ COPY --from=qemu-provider /qemu/ /app/lib/
 ENV QEMU_ESP32_LIB=/app/lib/libqemu-xtensa.so
 ENV QEMU_RISCV32_LIB=/app/lib/libqemu-riscv32.so
 
-# ── ESP-IDF toolchain for ESP32 compilation ──────────────────────────────────
-# Copied from espidf-builder stage: IDF framework + cross-compiler toolchains
+# ── ESP-IDF toolchain for ESP32 compilation ───────────────────────────────
+# Copied from our versioned external toolchain image (IDF 5.5.5/Arduino 3.3.12).
 COPY --from=espidf-builder /opt/esp-idf-v5 /opt/esp-idf-v5
 COPY --from=espidf-builder /root/.espressif /root/.espressif
 COPY --from=espidf-builder /opt/arduino-esp32-3 /opt/arduino-esp32-3
+COPY --from=mkspiffs-builder /root/.espressif/tools/mkspiffs/0.2.3/mkspiffs/mkspiffs /root/.espressif/tools/mkspiffs/0.2.3/mkspiffs/mkspiffs
+
+# Fail fast if the external image does not contain the requested versions.
+RUN set -eu; \
+    idf=/opt/esp-idf-v5/components/esp_common/include/esp_idf_version.h; \
+    ard=/opt/arduino-esp32-3/cores/esp32/esp_arduino_version.h; \
+    test -s "$idf" && test -s "$ard"; \
+    for spec in 'ESP_IDF_VERSION_MAJOR 5' 'ESP_IDF_VERSION_MINOR 5' 'ESP_IDF_VERSION_PATCH 5'; do \
+        key="${spec% *}"; val="${spec##* }"; \
+        grep -Eq "^#define[[:space:]]+${key}[[:space:]]+${val}([[:space:]]|$)" "$idf"; \
+    done; \
+    for spec in 'ESP_ARDUINO_VERSION_MAJOR 3' 'ESP_ARDUINO_VERSION_MINOR 3' 'ESP_ARDUINO_VERSION_PATCH 12'; do \
+        key="${spec% *}"; val="${spec##* }"; \
+        grep -Eq "^#define[[:space:]]+${key}[[:space:]]+${val}([[:space:]]|$)" "$ard"; \
+    done; \
+    test -x /root/.espressif/tools/mkspiffs/0.2.3/mkspiffs/mkspiffs; \
+    echo 'Validated ESP-IDF 5.5.5, Arduino-ESP32 3.3.12 and mkspiffs'
 
 # Legacy-path symlinks: espidf_compiler hardcodes /opt/esp-idf (version
 # signature, IDF_PATH default) and /opt/arduino-esp32, and the entrypoint
@@ -337,8 +249,10 @@ RUN if [ -f /opt/esp-idf/tools/ldgen/ldgen.py ]; then \
     fi; rm -f /tmp/ldgen_cache.py
 
 ENV IDF_PATH=/opt/esp-idf
+ENV IDF5_PATH=/opt/esp-idf-v5
 ENV IDF_TOOLS_PATH=/root/.espressif
 ENV ARDUINO_ESP32_PATH=/opt/arduino-esp32
+ENV ARDUINO_ESP32_5_PATH=/opt/arduino-esp32-3
 
 # ── ccache for ESP-IDF compiles ──────────────────────────────────────────────
 # ESP-IDF's build system honours IDF_CCACHE_ENABLE=1 and routes every C/C++
@@ -410,11 +324,9 @@ RUN rm -rf /root/.espressif/python_env/idf5.5_* \
  && rm -f /root/.espressif/espidf.constraints.v5.5.txt \
  && cd /opt/esp-idf-v5 \
  && ./tools/idf_tools.py install-python-env \
- # The v5.5.4 snapshot is internally inconsistent: its cmake hardcodes
- # component-manager interface_version 4 (project.cmake:64) while its
- # requirements pin idf-component-manager~=2.2, whose CLI tops out at
- # interface 3. Interface 4 lives in the 3.x line — install it and relax
- # both pins so the cmake python dependency check accepts the pairing.
+ # ESP-IDF v5.5.5 declares component-manager interface v4 but its core
+ # requirements still pin idf-component-manager~=2.2 (interface v3).
+ # Keep the upstream workaround and allow a 3.x component manager.
  && /root/.espressif/python_env/idf5.5_*/bin/pip install "idf-component-manager>=3.1,<4" \
  && sed -i 's/^idf-component-manager.*/idf-component-manager>=2.2,<4/' \
       /root/.espressif/espidf.constraints.v5.5.txt \
