@@ -29,9 +29,21 @@ jobs:
       - name: Checkout fork
         uses: actions/checkout@v4
 
-      - name: Checkout only our pinned QEMU submodule
+      - name: Checkout pinned QEMU submodule
         shell: bash
-        run: git submodule update --init --depth 1 third-party/velxio-qemu
+        env:
+          QEMU_REPO_READ_TOKEN: ${{ secrets.QEMU_REPO_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          # If the QEMU source repository is private, provide a fine-grained
+          # PAT with read-only Contents access to that repository.
+          if [[ -n "$QEMU_REPO_READ_TOKEN" ]]; then
+            auth="$(printf 'x-access-token:%s' "$QEMU_REPO_READ_TOKEN" | base64 -w0)"
+            git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth}" \
+              submodule update --init --depth 1 third-party/velxio-qemu
+          else
+            git submodule update --init --depth 1 third-party/velxio-qemu
+          fi
 
       - name: Validate source and ROM inputs
         shell: bash

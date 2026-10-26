@@ -1,0 +1,81 @@
+name: Propose QEMU Source and ROM Updates
+
+on:
+  schedule:
+    - cron: '37 8 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: qemu-dependencies-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  propose-update:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout velxio_iot
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          submodules: false
+
+      - name: Test ROM sync parser without secrets
+        run: python3 -m unittest discover -s tests -p 'test_sync_velxio_roms.py' -v
+
+      - name: Update pinned QEMU submodule revision
+        env:
+          QEMU_REPO_READ_TOKEN: ${{ secrets.QEMU_REPO_READ_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f .gitmodules || { echo 'Missing .gitmodules: add the QEMU submodule first'; exit 1; }
+          git config -f .gitmodules --get-regexp '^submodule\..*\.path$' | grep -F 'third-party/velxio-qemu'
+          # Cross-repository private submodule: optional read-only PAT.
+          # The auth header is ephemeral; no secret is stored in .git/config.
+          if [[ -n "$QEMU_REPO_READ_TOKEN" ]]; then
+            auth="$(printf 'x-access-token:%s' "$QEMU_REPO_READ_TOKEN" | base64 -w0)"
+            git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth}" \
+              submodule update --init --remote --depth 1 third-party/velxio-qemu
+          else
+            git submodule update --init --remote --depth 1 third-party/velxio-qemu
+          fi
+          test -s third-party/velxio-qemu/build_libqemu-esp32.sh || {
+            echo 'Selected QEMU revision lacks the build script'; exit 1;
+          }
+          echo "QEMU commit: $(git -C third-party/velxio-qemu rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Retrieve and verify upstream ROMs
+        env:
+          VELXIO_LICENSE_KEY: ${{ secrets.VELXIO_LICENSE_KEY }}
+        run: python3 scripts/sync_velxio_roms.py
+
+      - name: Verify local ROM checksum file
+        run: |
+          cd qemu-assets/roms
+          sha256sum -c SHA256SUMS
+
+      - name: Create or update review PR
+        uses: peter-evans/create-pull-request@v8
+        with:
+          token: ${{ github.token }}
+          branch: bot/update-qemu-dependencies
+          base: main
+          delete-branch: true
+          add-paths: |
+            third-party/velxio-qemu
+            qemu-assets/roms
+          commit-message: 'chore(qemu): update source revision and verified ROMs'
+          title: 'chore(qemu): review source and ROM updates'
+          body: |
+            Automated update of QEMU sources and/or the four QEMU ROM assets.
+            - QEMU source revision is pinned by the Git submodule pointer.
+            - ROM blobs were downloaded from Velxio and verified against SHA-256 and sizes from the asset manifest.
+            - No downloaded QEMU code was executed in this job.
+            - Review the diff, licenses and compatibility before merging.
+            - After merge, Build QEMU Image will rebuild on main.
+            - **This PR alone does not prove ESP32-S3 functionality**; run the emulator's integration tests.
