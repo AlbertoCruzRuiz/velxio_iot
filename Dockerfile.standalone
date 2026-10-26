@@ -8,18 +8,18 @@
 #     in /qemu/ (NOT a generic upstream QEMU build).
 #
 # Override these images in CI using Docker build args ESPIDF_IMAGE and QEMU_IMAGE:
-# docker buildx build -f Dockerfile.standalone --platform linux/amd64 \
-#   --build-arg ESPIDF_IMAGE=ghcr.io/USER/velxio-espidf-toolchain:idf-5.5.5-arduino-3.3.12 \
-#   --build-arg QEMU_IMAGE=ghcr.io/USER/velxio-qemu:VERSION .
+# docker buildx build --pull -f Dockerfile.standalone --platform linux/amd64 \
+#   --build-arg ESPIDF_IMAGE=ghcr.io/albertocruzruiz/velxio-espidf-toolchain:idf-5.5.5-arduino-3.3.12 \
+#   --build-arg QEMU_IMAGE=ghcr.io/albertocruzruiz/velxio-qemu:latest .
 #
 # No Velxio license key or QEMU asset download is used in this Dockerfile.
 
 # ---- Stage 0: independently built QEMU + ROM bundle ----
 ARG QEMU_IMAGE=ghcr.io/albertocruzruiz/velxio-qemu:latest
-ARG ESPIDF_IMAGE=velxio-espidf-toolchain:idf-5.5.5-arduino-3.3.12
 FROM ${QEMU_IMAGE} AS qemu-provider
 
 # ---- Stage 0.5: independently built ESP-IDF and Arduino core ----
+ARG ESPIDF_IMAGE=ghcr.io/albertocruzruiz/velxio-espidf-toolchain:idf-5.5.5-arduino-3.3.12
 FROM ${ESPIDF_IMAGE} AS espidf-builder
 
 # ---- Stage 0.6: mkspiffs, retained from the original standalone image ----
@@ -198,7 +198,19 @@ RUN set -eu; \
              esp32c3-rom.bin esp32s3_rev0_rom.bin; do \
         test -s "/app/lib/$f" || { echo "Missing or empty QEMU asset: $f" >&2; exit 1; }; \
     done; \
-    echo 'QEMU and ROM asset bundle present'
+    if [ -s /app/lib/SHA256SUMS ]; then \
+        (cd /app/lib && sha256sum -c SHA256SUMS); \
+    fi; \
+    for lib in /app/lib/libqemu-xtensa.so /app/lib/libqemu-riscv32.so; do \
+        ldd "$lib" > /tmp/qemu-ldd.txt; \
+        if grep -q 'not found' /tmp/qemu-ldd.txt; then \
+            echo "Unresolved library dependencies in $lib:" >&2; \
+            cat /tmp/qemu-ldd.txt >&2; \
+            exit 1; \
+        fi; \
+    done; \
+    rm -f /tmp/qemu-ldd.txt; \
+    echo 'QEMU and ROM asset bundle validated'
 
 # Activate ESP32 emulation
 # QEMU_ESP32_LIB    → Xtensa library (ESP32, ESP32-S3)
@@ -331,7 +343,7 @@ RUN rm -rf /root/.espressif/python_env/idf5.5_* \
  && sed -i 's/^idf-component-manager.*/idf-component-manager>=2.2,<4/' \
       /root/.espressif/espidf.constraints.v5.5.txt \
       /opt/esp-idf-v5/tools/requirements/requirements.core.txt \
- && find /root/.espressif -name '*.tar.*' -delete 2>/dev/null || true
+ && { find /root/.espressif -name '*.tar.*' -delete 2>/dev/null || true; }
 
 # System-python IDF deps. IDF 5.x has no root requirements.txt (the 4.4
 # tree did); its equivalent is tools/requirements/requirements.core.txt.
