@@ -13,8 +13,3 @@
 [submodule "third-party/wokwi-features"]
 	path = third-party/wokwi-features
 	url = https://github.com/wokwi/wokwi-features.git
-
-[submodule "third-party/velxio-qemu"]
-	path = third-party/velxio-qemu
-	url = https://github.com/AlbertoCruzRuiz/velxio-qemu.git
-	branch = main
