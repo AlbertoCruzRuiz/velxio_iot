@@ -15,7 +15,7 @@
 # No Velxio license key or QEMU asset download is used in this Dockerfile.
 
 # ---- Stage 0: independently built QEMU + ROM bundle ----
-ARG QEMU_IMAGE=velxio-qemu:local
+ARG QEMU_IMAGE=ghcr.io/albertocruzruiz/velxio-qemu:latest
 ARG ESPIDF_IMAGE=velxio-espidf-toolchain:idf-5.5.5-arduino-3.3.12
 FROM ${QEMU_IMAGE} AS qemu-provider
 
