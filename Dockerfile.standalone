@@ -14,12 +14,16 @@
 #
 # No Velxio license key or QEMU asset download is used in this Dockerfile.
 
-# ---- Stage 0: independently built QEMU + ROM bundle ----
+# ---- External build dependencies ----
+# Both arguments must be declared before the first FROM.
+
 ARG QEMU_IMAGE=ghcr.io/albertocruzruiz/velxio-qemu:latest
+ARG ESPIDF_IMAGE=ghcr.io/albertocruzruiz/velxio-espidf-toolchain:idf-5.5.5-arduino-3.3.12
+
+# ---- Stage 0: independently built QEMU + ROM bundle ----
 FROM ${QEMU_IMAGE} AS qemu-provider
 
 # ---- Stage 0.5: independently built ESP-IDF and Arduino core ----
-ARG ESPIDF_IMAGE=ghcr.io/albertocruzruiz/velxio-espidf-toolchain:idf-5.5.5-arduino-3.3.12
 FROM ${ESPIDF_IMAGE} AS espidf-builder
 
 # ---- Stage 0.6: mkspiffs, retained from the original standalone image ----
