@@ -1,91 +1,123 @@
-name: Publish Docker Image
+name: Build and Publish Velxio IoT Docker Image
 
 on:
   push:
-    branches: [ "master" ]
-  # Uncomment to also trigger on release tags:
-  # tags: [ 'v*.*.*' ]
+    branches:
+      - main
+
+  workflow_dispatch:
+
+  # Permite recibir actualizaciones desde velxio-qemu.
+  repository_dispatch:
+    types:
+      - qemu-published
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: velxio-build-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
-  REGISTRY_GHCR: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  VELXIO_IMAGE: ghcr.io/albertocruzruiz/velxio_iot
+  DEFAULT_QEMU_IMAGE: ghcr.io/albertocruzruiz/velxio-qemu:latest
+  ESPIDF_IMAGE: ghcr.io/albertocruzruiz/velxio-espidf-toolchain:idf-5.5.5-arduino-3.3.12
 
 jobs:
-  build-and-push-image:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
+  build-velxio:
+    name: Build Velxio (linux/amd64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
 
     steps:
-      - name: Checkout repository
+      - name: Checkout Velxio
         uses: actions/checkout@v4
 
-      - name: Set up QEMU (for multi-arch builds)
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130  # v3.7.0
+      - name: Select QEMU image
+        id: qemu
+        shell: bash
+        env:
+          DISPATCH_QEMU: ${{ github.event.client_payload.qemu_image }}
+        run: |
+          set -euo pipefail
+
+          image="${DEFAULT_QEMU_IMAGE}"
+
+          if [[ -n "${DISPATCH_QEMU}" ]]; then
+            case "${DISPATCH_QEMU}" in
+              ghcr.io/albertocruzruiz/velxio-qemu:sha-*)
+                image="${DISPATCH_QEMU}"
+                ;;
+              *)
+                echo "::error::Invalid QEMU image"
+                exit 1
+                ;;
+            esac
+          fi
+
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          echo "QEMU image: ${image}"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3.12.0
+        uses: docker/setup-buildx-action@v4
 
-      - name: Log in to GitHub Container Registry (GHCR)
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3.7.0
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
         with:
-          registry: ${{ env.REGISTRY_GHCR }}
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Log in to Docker Hub
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3.7.0
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Extract metadata (tags, labels) for Docker
-        id: meta
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051  # v5.10.0
-        with:
-          images: |
-            ${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME }}
-            docker.io/${{ secrets.DOCKERHUB_USERNAME }}/velxio
-
-      - name: Build and push Docker image
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
+      - name: Verify dependency images
+        shell: bash
         env:
-          # v6 uploads a .dockerbuild provenance artifact per build with NO
-          # expiry — 768 of them silently exhausted the account's Actions
-          # artifact-storage quota (which then broke artifact uploads in
-          # every other repo, e.g. qemu-lcgamboa's libqemu release CI).
-          DOCKER_BUILD_RECORD_UPLOAD: "false"
+          QEMU_IMAGE: ${{ steps.qemu.outputs.image }}
+        run: |
+          set -euo pipefail
+
+          docker buildx imagetools inspect \
+            "${QEMU_IMAGE}"
+
+          docker buildx imagetools inspect \
+            "${ESPIDF_IMAGE}"
+
+      - name: Build and publish Velxio
+        id: build
+        uses: docker/build-push-action@v7
         with:
           context: .
-          file: Dockerfile.standalone
-          platforms: linux/amd64,linux/arm64
+          file: ./Dockerfile.standalone
+          platforms: linux/amd64
+          pull: true
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+
+          tags: |
+            ${{ env.VELXIO_IMAGE }}:latest
+            ${{ env.VELXIO_IMAGE }}:sha-${{ github.sha }}
+
           build-args: |
-            ESPIDF_IMAGE=ghcr.io/davidmonterocrespo24/velxio-espidf-toolchain:latest
-            VELXIO_LICENSE_KEY=${{ secrets.VELXIO_BUILD_LICENSE_KEY }}
-          cache-from: type=gha
-          # mode=min only stores the layers used in the final image. mode=max
-          # also stores all intermediate layers, which doubles or triples the
-          # cache footprint on a multi-stage build like ours (qemu-provider +
-          # espidf-builder + frontend-builder + final stage). The 0.5 GB
-          # Actions storage quota burns through fast with max; min is enough
-          # to make incremental rebuilds fast on the layers that matter.
-          cache-to: type=gha,mode=min
+            QEMU_IMAGE=${{ steps.qemu.outputs.image }}
+            ESPIDF_IMAGE=${{ env.ESPIDF_IMAGE }}
 
-      - name: Ping search engines with sitemap
-        if: success()
+          cache-from: type=gha,scope=velxio
+          cache-to: type=gha,scope=velxio,mode=min
+          provenance: mode=min
+
+      - name: Build summary
+        shell: bash
+        env:
+          QEMU_IMAGE: ${{ steps.qemu.outputs.image }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
-          curl -s "https://www.google.com/ping?sitemap=https%3A%2F%2Fvelxio.dev%2Fsitemap.xml" -o /dev/null -w "Google ping: %{http_code}\n"
-          curl -s "https://www.bing.com/ping?sitemap=https%3A%2F%2Fvelxio.dev%2Fsitemap.xml" -o /dev/null -w "Bing ping: %{http_code}\n"
-
-      - name: Update Docker Hub description
-        uses: peter-evans/dockerhub-description@432a30c9e07499fd01da9f8a49f0faf9e0ca5b77  # v4.0.2
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-          repository: ${{ secrets.DOCKERHUB_USERNAME }}/velxio
-          short-description: "Local, open-source Arduino emulator — real AVR8 emulation, 48+ components, Monaco editor, arduino-cli backend."
-          readme-filepath: ./README.md
+          {
+            echo "### Velxio IoT build"
+            echo ""
+            echo "- Commit: \`${GITHUB_SHA}\`"
+            echo "- Platform: \`linux/amd64\`"
+            echo "- QEMU: \`${QEMU_IMAGE}\`"
+            echo "- ESP-IDF: \`${ESPIDF_IMAGE}\`"
+            echo "- Published: \`${VELXIO_IMAGE}:latest\`"
+            echo "- Digest: \`${IMAGE_DIGEST}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
